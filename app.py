@@ -3,6 +3,7 @@ import cv2
 import easyocr
 import numpy as np
 import io
+import gc  # 新增：用於手動強制釋放記憶體
 from pptx import Presentation
 from pptx.util import Pt
 from pptx.dml.color import RGBColor
@@ -15,13 +16,31 @@ st.title("🪄 圖片轉可編輯 PPT 神器")
 st.write("上傳一張圖片，AI 會自動將裡面的圖案轉成「積木色塊」，並把文字轉成「PPT 文字方塊」！")
 
 # ---------------------------------------------------------
-# 2. 載入 AI 模型 (加入 Cache 讓它只載入一次，不用每次等)
+# 2. 載入 AI 模型 (只載入一次，避免重複撐爆 RAM)
 # ---------------------------------------------------------
 @st.cache_resource
 def load_ocr_model():
+    # 強制使用 CPU 模式以適應免費雲端伺服器
     return easyocr.Reader(['ch_tra', 'en'], gpu=False)
 
 reader = load_ocr_model()
+
+# ---------------------------------------------------------
+# 2.5 新增：快取圖片辨識結果 (@st.cache_data)
+# ---------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def perform_ocr(image_bytes):
+    """
+    這個函數會把圖片的 Byte 資料與 OCR 結果綁定。
+    只要上傳的圖片是同一張，就不會重複執行吃力的 PyTorch 運算！
+    """
+    img_np = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), 1)
+    results = reader.readtext(img_np)
+    
+    # 辨識完畢立刻釋放暫存矩陣
+    del img_np
+    gc.collect()
+    return results
 
 # ---------------------------------------------------------
 # 3. 網頁控制面板 (側邊欄)
@@ -43,36 +62,34 @@ with st.sidebar:
 uploaded_file = st.file_uploader("📂 請上傳圖片 (支援 PNG, JPG, JPEG)", type=['png', 'jpg', 'jpeg'])
 
 if uploaded_file is not None:
-    # 在網頁上顯示使用者上傳的圖片
     st.image(uploaded_file, caption="上傳的圖片預覽", use_container_width=True)
     
-    # 建立一個轉換按鈕
     if st.button("🚀 開始轉換為 PPT"):
-        
-        # 建立進度條與狀態文字
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        status_text.text("🧠 正在讀取圖片與辨識文字...")
+        # 取得圖片的二進位資料 (供快取函數比對使用)
+        file_bytes = uploaded_file.getvalue()
         
-        # 將上傳的檔案轉換為 OpenCV 看得懂的格式
-        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, 1)
+        status_text.text("🧠 正在讀取圖片與辨識文字 (若為相同圖片將啟用秒速快取)...")
+        
+        # 呼叫快取的 OCR 函數
+        text_results = perform_ocr(file_bytes)
+
+        # 重新將檔案轉換為 OpenCV 格式供後續繪圖使用
+        img = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), 1)
         img_h, img_w = img.shape[:2]
 
-        # 準備 PPT
         prs = Presentation()
         slide = prs.slides.add_slide(prs.slide_layouts[6])
 
-        # === 【AI 文字辨識與虛擬橡皮擦】 ===
-        text_results = reader.readtext(img)
+        # === 【文字虛擬橡皮擦】 ===
         text_data_to_draw = []
-
         if text_results:
             for (bbox, text, prob) in text_results:
                 text_data_to_draw.append((bbox, text))
                 pts = np.array(bbox, np.int32)
-                cv2.fillPoly(img, [pts], (255, 255, 255)) # 把文字塗白
+                cv2.fillPoly(img, [pts], (255, 255, 255))
 
         # === 【繪製圖形 (掃描線積木填色)】 ===
         status_text.text("🎨 正在繪製積木色塊...")
@@ -86,9 +103,7 @@ if uploaded_file is not None:
         offset_y = (max_ppt_h - (block_h * ppt_scale)) / 2
 
         for y in range(block_h):
-            # 更新網頁上的進度條
             progress_bar.progress((y + 1) / block_h)
-            
             x = 0
             while x < res_val:
                 b, g, r = small_img[y, x]
@@ -137,12 +152,15 @@ if uploaded_file is not None:
         # === 【將 PPT 存入記憶體並提供下載】 ===
         status_text.text("✅ 轉換完成！請點擊下方按鈕下載 PPT。")
         
-        # 這裡不存成實體檔案，而是存在「記憶體(BytesIO)」中，這樣網頁才能提供下載
         ppt_stream = io.BytesIO()
         prs.save(ppt_stream)
         ppt_stream.seek(0)
         
-        # 顯示綠色的成功訊息與下載按鈕
+        # 🛡️ 終極防護：強制清空龐大的圖形矩陣，歸還系統記憶體
+        del img
+        del small_img
+        gc.collect()
+        
         st.success("轉換成功！")
         st.download_button(
             label="📥 下載可編輯的 PPT 檔案",
